@@ -7,33 +7,33 @@
 #include <vector>
 
 enum class NiftiVersion : int {
-    Nifti2 = 2,
-    Nifti1 = 1
+    Nifti1 = 1,
+    Nifti2 = 2
 };
 
 class NiftiLoader {
 public:
-    // Loads a 3D T1-weighted NIfTI-2 or NIfTI-1 volume (.nii, .nii.gz, or .hdr/.img)
+    // Auto-detects and loads both NIfTI-2 (540B) and NIfTI-1 (348B) volumes (.nii, .nii.gz, .hdr/.img)
     static MriVolume loadMri(const std::string& filepath);
 
-    // Loads a 3D integer label NIfTI-2 or NIfTI-1 volume into SegmentationResult
+    // Auto-detects and loads both NIfTI-2 and NIfTI-1 integer label volumes
     static SegmentationResult loadLabels(const std::string& filepath);
 
-    // Saves a 3D uint8 label grid (defaults to NIfTI-2, falls back to NIfTI-1 if requested)
+    // Defaults to NIfTI-1; auto-promotes to NIfTI-2 if dimensions exceed 32,767 or NiftiVersion::Nifti2 is passed
     static void saveLabels(
         const std::string& filepath,
         const std::vector<uint8_t>& labels,
         int nx, int ny, int nz,
         const std::array<double, 3>& spacing_mm,
         const std::array<double, 16>& affine_mm,
-        NiftiVersion version = NiftiVersion::Nifti2
+        NiftiVersion version = NiftiVersion::Nifti1
     );
 
-    // Saves a 3D double scalar field (defaults to NIfTI-2, falls back to NIfTI-1 if requested)
+    // Defaults to NIfTI-1; auto-promotes to NIfTI-2 if dimensions exceed 32,767 or NiftiVersion::Nifti2 is passed
     static void saveScalarGrid(
         const std::string& filepath,
         const Grid3D& grid,
         const std::array<double, 16>& affine_mm,
-        NiftiVersion version = NiftiVersion::Nifti2
+        NiftiVersion version = NiftiVersion::Nifti1
     );
 };

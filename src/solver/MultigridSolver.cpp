@@ -1,6 +1,9 @@
 #include "solver/MultigridSolver.h"
 #include "solver/FemStencil.h"
+#include <cstddef>
+#include <cstdint>
 #include <iostream>
+#include <vector>
 
 #ifdef TMS_USE_OPENMP
 #include <omp.h>
@@ -39,7 +42,9 @@ SolverStats MultigridSolver::solve(MultigridHierarchy& hierarchy) {
 
 SolverStats MultigridSolver::solveStandaloneVCycle(MultigridHierarchy& hierarchy) {
     GridLevel& finest = hierarchy.level(0);
-    finest.phi.fill(0.0);
+    if (!cfg_.use_initial_guess) {
+        finest.phi.fill(0.0);
+    }
 
     const double f_norm = finest.f.l2Norm();
     SolverStats stats{};
@@ -76,31 +81,110 @@ SolverStats MultigridSolver::solveMGCG(MultigridHierarchy& hierarchy) {
     const int ny = finest.phi.ny();
     const int nz = finest.phi.nz();
     const double h = finest.h;
+    const size_t n = finest.phi.size();
 
     const double f_norm = finest.f.l2Norm();
     SolverStats stats{};
     if (f_norm == 0.0) {
+        finest.phi.fill(0.0);
         stats.converged = true;
         return stats;
     }
 
-    // x = solution potential, r_cg = residual, p = search direction, Ap = A * p
+    // Identify active tissue nodes (diag_weight > 0) for nullspace projection
+    std::vector<uint8_t> active_nodes(n, 0);
+    size_t active_count = 0;
+
+    for (int k = 1; k < nz - 1; ++k) {
+        for (int j = 1; j < ny - 1; ++j) {
+            for (int i = 1; i < nx - 1; ++i) {
+                double off_diag = 0.0;
+                double diag_w = 0.0;
+                FemStencil::evaluateNode(finest.phi, finest.sigma, i, j, k, off_diag, diag_w);
+                if (diag_w > 0.0) {
+                    const size_t idx =
+                        static_cast<size_t>(i) + nx * (static_cast<size_t>(j) + ny * k);
+                    active_nodes[idx] = 1;
+                    ++active_count;
+                }
+            }
+        }
+    }
+
+    auto projectZeroMean = [&](Grid3D& g) {
+        if (!cfg_.project_nullspace || active_count == 0) return;
+        double* ptr = g.raw();
+        double sum = 0.0;
+
+#ifdef TMS_USE_OPENMP
+        #pragma omp parallel for reduction(+:sum) schedule(static)
+#endif
+        for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(n); ++idx) {
+            if (active_nodes[idx]) sum += ptr[idx];
+        }
+
+        const double mean = sum / static_cast<double>(active_count);
+
+#ifdef TMS_USE_OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(n); ++idx) {
+            if (active_nodes[idx]) ptr[idx] -= mean;
+        }
+    };
+
     Grid3D x(nx, ny, nz, h, 0.0);
-    Grid3D r_cg = finest.f;
+    Grid3D r_cg(nx, ny, nz, h, 0.0);
     Grid3D p(nx, ny, nz, h, 0.0);
     Grid3D Ap(nx, ny, nz, h, 0.0);
 
-    // Save original RHS f^h so finest.f can serve as V-cycle input z = M^{-1} r_cg
     const Grid3D f_orig = finest.f;
 
-    // z_0 = M^{-1} r_0 (1 symmetric V-cycle with zero initial guess)
+    if (cfg_.use_initial_guess) {
+        double* px = x.raw();
+        const double* p_init = finest.phi.raw();
+#ifdef TMS_USE_OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(n); ++idx) {
+            px[idx] = active_nodes[idx] ? p_init[idx] : 0.0;
+        }
+        projectZeroMean(x);
+
+        applyOperator(x, finest.sigma, Ap);
+        double* pr = r_cg.raw();
+        const double* pf = f_orig.raw();
+        const double* pAp_ptr = Ap.raw();
+#ifdef TMS_USE_OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(n); ++idx) {
+            pr[idx] = active_nodes[idx] ? (pf[idx] - pAp_ptr[idx]) : 0.0;
+        }
+    } else {
+        r_cg = f_orig;
+    }
+
+    projectZeroMean(r_cg);
+
+    const double init_rel_res = r_cg.l2Norm() / f_norm;
+    if (init_rel_res <= cfg_.rel_residual_tol) {
+        finest.phi = x;
+        finest.f = f_orig;
+        computeResidual(finest);
+        stats.final_rel_residual = init_rel_res;
+        stats.converged = true;
+        return stats;
+    }
+
+    // z_0 = P_perp * M^{-1} * r_0
     finest.f = r_cg;
     finest.phi.fill(0.0);
     vCycle(hierarchy, 0);
+    projectZeroMean(finest.phi);
     p = finest.phi;
 
     double rz_old = dotProduct(r_cg, finest.phi);
-    const size_t n = x.size();
 
     for (int iter = 1; iter <= cfg_.max_vcycles; ++iter) {
         applyOperator(p, finest.sigma, Ap);
@@ -118,9 +202,13 @@ SolverStats MultigridSolver::solveMGCG(MultigridHierarchy& hierarchy) {
         #pragma omp parallel for schedule(static)
 #endif
         for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(n); ++idx) {
-            px[idx] += alpha * pp[idx];
-            pr[idx] -= alpha * pAp_ptr[idx];
+            if (active_nodes[idx]) {
+                px[idx] += alpha * pp[idx];
+                pr[idx] -= alpha * pAp_ptr[idx];
+            }
         }
+
+        projectZeroMean(r_cg);
 
         const double rel_res = r_cg.l2Norm() / f_norm;
         stats.iterations = iter;
@@ -135,10 +223,11 @@ SolverStats MultigridSolver::solveMGCG(MultigridHierarchy& hierarchy) {
             break;
         }
 
-        // Preconditioner step: z_{k+1} = M^{-1} r_{k+1}
+        // Preconditioner step: z_{k+1} = P_perp * M^{-1} * r_{k+1}
         finest.f = r_cg;
         finest.phi.fill(0.0);
         vCycle(hierarchy, 0);
+        projectZeroMean(finest.phi);
 
         const double rz_new = dotProduct(r_cg, finest.phi);
         const double beta = rz_new / rz_old;
@@ -151,7 +240,9 @@ SolverStats MultigridSolver::solveMGCG(MultigridHierarchy& hierarchy) {
         #pragma omp parallel for schedule(static)
 #endif
         for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(n); ++idx) {
-            pp_mut[idx] = pz[idx] + beta * pp_mut[idx];
+            if (active_nodes[idx]) {
+                pp_mut[idx] = pz[idx] + beta * pp_mut[idx];
+            }
         }
     }
 

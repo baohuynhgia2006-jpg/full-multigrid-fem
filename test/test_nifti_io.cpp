@@ -146,11 +146,11 @@ void testRoundTripVersion(NiftiVersion version, const fs::path& tmp_dir) {
 int main() {
     const fs::path tmp_dir = fs::temp_directory_path();
 
-    // Default output format: NIfTI-2 (540-byte header, "n+2")
-    testRoundTripVersion(NiftiVersion::Nifti2, tmp_dir);
-
-    // Explicit fallback: NIfTI-1 (348-byte header, "n+1")
+    // Default output format: NIfTI-1 (348-byte header, "n+1", Slicer/FSL/SPM compatible)
     testRoundTripVersion(NiftiVersion::Nifti1, tmp_dir);
+
+    // Explicit NIfTI-2 output (540-byte header, "n+2", 64-bit dimensions/affines)
+    testRoundTripVersion(NiftiVersion::Nifti2, tmp_dir);
 
     return 0;
 }

@@ -1,4 +1,5 @@
 #pragma once
+#include "../grid/Grid3D.h"
 #include "../segmentation/SegmentationTypes.h"
 #include <array>
 #include <cstdint>
@@ -30,5 +31,16 @@ public:
         double target_h_mm,
         int num_levels,
         int min_air_pad_voxels = 2
+    );
+
+    // Removes any disconnected non-air islands after label resampling
+    static void keepLargestHeadComponent(SolverGridVolume& vol);
+
+    // Trilinearly interpolates nodal potential phi from a coarse grid onto a fine grid
+    static void interpolateNodalField(
+        const Grid3D& src_phi,
+        const std::array<double, 3>& src_origin_m,
+        Grid3D& dst_phi,
+        const std::array<double, 3>& dst_origin_m
     );
 };

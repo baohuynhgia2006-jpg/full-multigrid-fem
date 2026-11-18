@@ -502,6 +502,87 @@ void parseNiftiMetaAndPayload(
     }
 }
 
+void affineToNiftiQuatern(
+    const std::array<double, 16>& aff,
+    double& qfac,
+    double& qb, double& qc, double& qd,
+    double& qx, double& qy, double& qz
+) {
+    qx = aff[3];
+    qy = aff[7];
+    qz = aff[11];
+
+    double c0[3] = {aff[0], aff[4], aff[8]};
+    double c1[3] = {aff[1], aff[5], aff[9]};
+    double c2[3] = {aff[2], aff[6], aff[10]};
+
+    const double dx = std::sqrt(c0[0] * c0[0] + c0[1] * c0[1] + c0[2] * c0[2]);
+    const double dy = std::sqrt(c1[0] * c1[0] + c1[1] * c1[1] + c1[2] * c1[2]);
+    const double dz = std::sqrt(c2[0] * c2[0] + c2[1] * c2[1] + c2[2] * c2[2]);
+
+    if (dx < 1e-12 || dy < 1e-12 || dz < 1e-12) {
+        qfac = 1.0;
+        qb = qc = qd = 0.0;
+        return;
+    }
+
+    for (int r = 0; r < 3; ++r) {
+        c0[r] /= dx;
+        c1[r] /= dy;
+        c2[r] /= dz;
+    }
+
+    const double det =
+        c0[0] * (c1[1] * c2[2] - c1[2] * c2[1]) -
+        c1[0] * (c0[1] * c2[2] - c0[2] * c2[1]) +
+        c2[0] * (c0[1] * c1[2] - c0[2] * c1[1]);
+
+    qfac = (det < 0.0) ? -1.0 : 1.0;
+    if (qfac < 0.0) {
+        c2[0] = -c2[0];
+        c2[1] = -c2[1];
+        c2[2] = -c2[2];
+    }
+
+    const double r00 = c0[0], r01 = c1[0], r02 = c2[0];
+    const double r10 = c0[1], r11 = c1[1], r12 = c2[1];
+    const double r20 = c0[2], r21 = c1[2], r22 = c2[2];
+
+    double a = 0.0;
+    const double trace = r00 + r11 + r22;
+    if (trace > 0.0) {
+        const double s = 0.5 / std::sqrt(trace + 1.0);
+        a  = 0.25 / s;
+        qb = (r21 - r12) * s;
+        qc = (r02 - r20) * s;
+        qd = (r10 - r01) * s;
+    } else if (r00 > r11 && r00 > r22) {
+        const double s = 2.0 * std::sqrt(1.0 + r00 - r11 - r22);
+        a  = (r21 - r12) / s;
+        qb = 0.25 * s;
+        qc = (r01 + r10) / s;
+        qd = (r02 + r20) / s;
+    } else if (r11 > r22) {
+        const double s = 2.0 * std::sqrt(1.0 + r11 - r00 - r22);
+        a  = (r02 - r20) / s;
+        qb = (r01 + r10) / s;
+        qc = 0.25 * s;
+        qd = (r12 + r21) / s;
+    } else {
+        const double s = 2.0 * std::sqrt(1.0 + r22 - r00 - r11);
+        a  = (r10 - r01) / s;
+        qb = (r02 + r20) / s;
+        qc = (r12 + r21) / s;
+        qd = 0.25 * s;
+    }
+
+    if (a < 0.0) {
+        qb = -qb;
+        qc = -qc;
+        qd = -qd;
+    }
+}
+
 void writeNiftiBuffer(
     const std::string& filepath,
     const uint8_t* payload,
@@ -511,66 +592,51 @@ void writeNiftiBuffer(
     int nx, int ny, int nz,
     const std::array<double, 3>& spacing_mm,
     const std::array<double, 16>& affine_mm,
-    NiftiVersion version
+    NiftiVersion requested_version
 ) {
+    // Auto-promote to NIfTI-2 only if spatial dimensions exceed int16_t capacity
+    NiftiVersion version = requested_version;
     constexpr int kMaxInt16 = std::numeric_limits<int16_t>::max();
-    if (version == NiftiVersion::Nifti1 &&
-        (nx > kMaxInt16 || ny > kMaxInt16 || nz > kMaxInt16)) {
-        throw std::invalid_argument(
-            "Grid dimensions exceed int16_t limit (32767) required by NIfTI-1 fallback"
-        );
+    if (nx > kMaxInt16 || ny > kMaxInt16 || nz > kMaxInt16) {
+        version = NiftiVersion::Nifti2;
     }
 
-    if (version == NiftiVersion::Nifti2) {
-        // Default path: NIfTI-2
-        Nifti2Header hdr{};
-        hdr.sizeof_hdr = 540;
-        constexpr char kNifti2Magic[8] = {'n', '+', '2', '\0', '\r', '\n', '\032', '\n'};
-        std::memcpy(hdr.magic, kNifti2Magic, 8);
-        hdr.datatype = datatype;
-        hdr.bitpix = bitpix;
-        hdr.dim[0] = 3;
-        hdr.dim[1] = nx;
-        hdr.dim[2] = ny;
-        hdr.dim[3] = nz;
-        hdr.pixdim[0] = 1.0;
-        hdr.pixdim[1] = spacing_mm[0];
-        hdr.pixdim[2] = spacing_mm[1];
-        hdr.pixdim[3] = spacing_mm[2];
-        hdr.vox_offset = 544;
-        hdr.scl_slope = 1.0;
-        hdr.scl_inter = 0.0;
-        hdr.xyzt_units = 2; // NIFTI_UNITS_MM
-        hdr.sform_code = 1; // NIFTI_XFORM_SCANNER_ANAT
-        for (int c = 0; c < 4; ++c) {
-            hdr.srow_x[c] = affine_mm[0 + c];
-            hdr.srow_y[c] = affine_mm[4 + c];
-            hdr.srow_z[c] = affine_mm[8 + c];
-        }
+    double qfac = 1.0, qb = 0.0, qc = 0.0, qd = 0.0, qx = 0.0, qy = 0.0, qz = 0.0;
+    affineToNiftiQuatern(affine_mm, qfac, qb, qc, qd, qx, qy, qz);
 
-        std::vector<uint8_t> out(544 + payload_bytes, 0);
-        std::memcpy(out.data(), &hdr, sizeof(Nifti2Header));
-        std::memcpy(out.data() + 544, payload, payload_bytes);
-        writeFileBytes(filepath, out.data(), out.size());
-    } else {
-        // Fallback path: NIfTI-1
+    if (version == NiftiVersion::Nifti1) {
         Nifti1Header hdr{};
         hdr.sizeof_hdr = 348;
         hdr.dim[0] = 3;
         hdr.dim[1] = static_cast<int16_t>(nx);
         hdr.dim[2] = static_cast<int16_t>(ny);
         hdr.dim[3] = static_cast<int16_t>(nz);
+        hdr.dim[4] = 1;
+        hdr.dim[5] = 1;
+        hdr.dim[6] = 1;
+        hdr.dim[7] = 1;
         hdr.datatype = datatype;
         hdr.bitpix = bitpix;
-        hdr.pixdim[0] = 1.0f;
+        hdr.pixdim[0] = static_cast<float>(qfac);
         hdr.pixdim[1] = static_cast<float>(spacing_mm[0]);
         hdr.pixdim[2] = static_cast<float>(spacing_mm[1]);
         hdr.pixdim[3] = static_cast<float>(spacing_mm[2]);
+        hdr.pixdim[4] = 1.0f;
+        hdr.pixdim[5] = 1.0f;
+        hdr.pixdim[6] = 1.0f;
+        hdr.pixdim[7] = 1.0f;
         hdr.vox_offset = 352.0f;
         hdr.scl_slope = 1.0f;
         hdr.scl_inter = 0.0f;
         hdr.xyzt_units = 2; // NIFTI_UNITS_MM
+        hdr.qform_code = 1; // NIFTI_XFORM_SCANNER_ANAT
         hdr.sform_code = 1; // NIFTI_XFORM_SCANNER_ANAT
+        hdr.quatern_b = static_cast<float>(qb);
+        hdr.quatern_c = static_cast<float>(qc);
+        hdr.quatern_d = static_cast<float>(qd);
+        hdr.qoffset_x = static_cast<float>(qx);
+        hdr.qoffset_y = static_cast<float>(qy);
+        hdr.qoffset_z = static_cast<float>(qz);
         for (int c = 0; c < 4; ++c) {
             hdr.srow_x[c] = static_cast<float>(affine_mm[0 + c]);
             hdr.srow_y[c] = static_cast<float>(affine_mm[4 + c]);
@@ -581,6 +647,51 @@ void writeNiftiBuffer(
         std::vector<uint8_t> out(352 + payload_bytes, 0);
         std::memcpy(out.data(), &hdr, sizeof(Nifti1Header));
         std::memcpy(out.data() + 352, payload, payload_bytes);
+        writeFileBytes(filepath, out.data(), out.size());
+    } else {
+        Nifti2Header hdr{};
+        hdr.sizeof_hdr = 540;
+        constexpr char kNifti2Magic[8] = {'n', '+', '2', '\0', '\r', '\n', '\032', '\n'};
+        std::memcpy(hdr.magic, kNifti2Magic, 8);
+        hdr.datatype = datatype;
+        hdr.bitpix = bitpix;
+        hdr.dim[0] = 3;
+        hdr.dim[1] = nx;
+        hdr.dim[2] = ny;
+        hdr.dim[3] = nz;
+        hdr.dim[4] = 1;
+        hdr.dim[5] = 1;
+        hdr.dim[6] = 1;
+        hdr.dim[7] = 1;
+        hdr.pixdim[0] = qfac;
+        hdr.pixdim[1] = spacing_mm[0];
+        hdr.pixdim[2] = spacing_mm[1];
+        hdr.pixdim[3] = spacing_mm[2];
+        hdr.pixdim[4] = 1.0;
+        hdr.pixdim[5] = 1.0;
+        hdr.pixdim[6] = 1.0;
+        hdr.pixdim[7] = 1.0;
+        hdr.vox_offset = 544;
+        hdr.scl_slope = 1.0;
+        hdr.scl_inter = 0.0;
+        hdr.xyzt_units = 2; // NIFTI_UNITS_MM
+        hdr.qform_code = 1;
+        hdr.sform_code = 1;
+        hdr.quatern_b = qb;
+        hdr.quatern_c = qc;
+        hdr.quatern_d = qd;
+        hdr.qoffset_x = qx;
+        hdr.qoffset_y = qy;
+        hdr.qoffset_z = qz;
+        for (int c = 0; c < 4; ++c) {
+            hdr.srow_x[c] = affine_mm[0 + c];
+            hdr.srow_y[c] = affine_mm[4 + c];
+            hdr.srow_z[c] = affine_mm[8 + c];
+        }
+
+        std::vector<uint8_t> out(544 + payload_bytes, 0);
+        std::memcpy(out.data(), &hdr, sizeof(Nifti2Header));
+        std::memcpy(out.data() + 544, payload, payload_bytes);
         writeFileBytes(filepath, out.data(), out.size());
     }
 }

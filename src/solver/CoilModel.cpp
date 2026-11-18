@@ -1,6 +1,9 @@
 #include "solver/CoilModel.h"
 #include <cmath>
 #include <utility>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
 
 CoilModel::CoilModel(std::vector<MagneticDipole> dipoles)
     : dipoles_(std::move(dipoles)) {}
@@ -97,4 +100,187 @@ void CoilModel::evaluateA0Prime(
             }
         }
     }
+}
+
+CoilModel CoilModel::createMagstim70Coil(int num_rings, int dipoles_per_ring) {
+    constexpr double kPi = 3.14159265358979323846;
+    constexpr double r_inner = 0.028;
+    constexpr double r_outer = 0.043;
+    constexpr double wing_offset = 0.044;
+
+    std::vector<MagneticDipole> dipoles;
+    dipoles.reserve(static_cast<size_t>(2 * num_rings * dipoles_per_ring));
+
+    for (int loop = 0; loop < 2; ++loop) {
+        const double center_x = (loop == 0) ? -wing_offset : wing_offset;
+        const double polarity = (loop == 0) ? 1.0 : -1.0;
+
+        for (int ring = 0; ring < num_rings; ++ring) {
+            const double t = (num_rings > 1)
+                ? static_cast<double>(ring) / static_cast<double>(num_rings - 1)
+                : 0.5;
+            const double r = r_inner + t * (r_outer - r_inner);
+            const double area = kPi * r * r;
+            const double sub_moment = area / static_cast<double>(dipoles_per_ring);
+
+            for (int n = 0; n < dipoles_per_ring; ++n) {
+                const double theta = (2.0 * kPi * n) / dipoles_per_ring;
+                const double x = center_x + r * std::cos(theta);
+                const double y = r * std::sin(theta);
+                dipoles.push_back({{x, y, 0.0}, {0.0, 0.0, polarity * sub_moment}});
+            }
+        }
+    }
+
+    return CoilModel(std::move(dipoles));
+}
+
+CoilModel CoilModel::createCircularCoil(double loop_radius_m, int num_dipoles) {
+    constexpr double kPi = 3.14159265358979323846;
+    const double area = kPi * loop_radius_m * loop_radius_m;
+    const double sub_moment = area / static_cast<double>(num_dipoles);
+
+    std::vector<MagneticDipole> dipoles;
+    dipoles.reserve(static_cast<size_t>(num_dipoles));
+
+    for (int n = 0; n < num_dipoles; ++n) {
+        const double theta = (2.0 * kPi * n) / num_dipoles;
+        dipoles.push_back({
+            {loop_radius_m * std::cos(theta), loop_radius_m * std::sin(theta), 0.0},
+            {0.0, 0.0, sub_moment}
+        });
+    }
+
+    return CoilModel(std::move(dipoles));
+}
+
+CoilModel CoilModel::loadFromCcdFile(const std::string& filepath) {
+    std::ifstream ifs(filepath);
+    if (!ifs) {
+        throw std::runtime_error("Failed to open coil .ccd file: " + filepath);
+    }
+
+    std::vector<MagneticDipole> dipoles;
+    std::string line;
+    bool skipped_count_header = false;
+
+    while (std::getline(ifs, line)) {
+        // Strip comments starting with '#' or '%'
+        const size_t comment_pos = line.find_first_of("#%");
+        if (comment_pos != std::string::npos) {
+            line.erase(comment_pos);
+        }
+
+        std::istringstream iss(line);
+        std::vector<double> vals;
+        double v = 0.0;
+        while (iss >> v) {
+            vals.push_back(v);
+        }
+
+        if (vals.empty()) continue;
+
+        // Standard SimNIBS .ccd files have a single integer line giving the dipole count
+        if (vals.size() == 1 && !skipped_count_header && dipoles.empty()) {
+            skipped_count_header = true;
+            dipoles.reserve(static_cast<size_t>(std::max(0.0, vals[0])));
+            continue;
+        }
+
+        if (vals.size() >= 6) {
+            dipoles.push_back({
+                {vals[0], vals[1], vals[2]},
+                {vals[3], vals[4], vals[5]}
+            });
+        }
+    }
+
+    if (dipoles.empty()) {
+        throw std::runtime_error("No valid dipole rows (x y z mx my mz) found in: " + filepath);
+    }
+
+    return CoilModel(std::move(dipoles));
+}
+
+std::array<double, 9> CoilModel::rotationFromEulerDeg(
+    double rx_deg, double ry_deg, double rz_deg
+) {
+    constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+    const double ax = rx_deg * kDegToRad;
+    const double ay = ry_deg * kDegToRad;
+    const double az = rz_deg * kDegToRad;
+
+    const double cx = std::cos(ax), sx = std::sin(ax);
+    const double cy = std::cos(ay), sy = std::sin(ay);
+    const double cz = std::cos(az), sz = std::sin(az);
+
+    // R = Rz(az) * Ry(ay) * Rx(ax)
+    return {
+        cz * cy,  cz * sy * sx - sz * cx,  cz * sy * cx + sz * sx,
+        sz * cy,  sz * sy * sx + cz * cx,  sz * sy * cx - cz * sx,
+        -sy,      cy * sx,                 cy * cx
+    };
+}
+
+std::array<double, 9> CoilModel::rotationFromNormalAndYaw(
+    const std::array<double, 3>& outward_normal,
+    double yaw_deg
+) {
+    constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+    const double n_len = std::sqrt(
+        outward_normal[0] * outward_normal[0] +
+        outward_normal[1] * outward_normal[1] +
+        outward_normal[2] * outward_normal[2]
+    );
+    std::array<double, 3> z_axis = {0.0, 0.0, 1.0};
+    if (n_len > 1e-12) {
+        z_axis = {
+            outward_normal[0] / n_len,
+            outward_normal[1] / n_len,
+            outward_normal[2] / n_len
+        };
+    }
+
+    // Pick reference vector not parallel to z_axis to construct tangent basis
+    std::array<double, 3> ref = (std::abs(z_axis[1]) < 0.9)
+        ? std::array<double, 3>{0.0, 1.0, 0.0}
+        : std::array<double, 3>{1.0, 0.0, 0.0};
+
+    // x0 = normalize(ref x z_axis)
+    std::array<double, 3> x0 = {
+        ref[1] * z_axis[2] - ref[2] * z_axis[1],
+        ref[2] * z_axis[0] - ref[0] * z_axis[2],
+        ref[0] * z_axis[1] - ref[1] * z_axis[0]
+    };
+    const double x0_len = std::sqrt(x0[0] * x0[0] + x0[1] * x0[1] + x0[2] * x0[2]);
+    x0[0] /= x0_len; x0[1] /= x0_len; x0[2] /= x0_len;
+
+    // y0 = z_axis x x0
+    const std::array<double, 3> y0 = {
+        z_axis[1] * x0[2] - z_axis[2] * x0[1],
+        z_axis[2] * x0[0] - z_axis[0] * x0[2],
+        z_axis[0] * x0[1] - z_axis[1] * x0[0]
+    };
+
+    const double yaw = yaw_deg * kDegToRad;
+    const double cy = std::cos(yaw);
+    const double sy = std::sin(yaw);
+
+    const std::array<double, 3> x_axis = {
+        cy * x0[0] + sy * y0[0],
+        cy * x0[1] + sy * y0[1],
+        cy * x0[2] + sy * y0[2]
+    };
+    const std::array<double, 3> y_axis = {
+        -sy * x0[0] + cy * y0[0],
+        -sy * x0[1] + cy * y0[1],
+        -sy * x0[2] + cy * y0[2]
+    };
+
+    // Columns are [x_axis, y_axis, z_axis] stored in row-major order
+    return {
+        x_axis[0], y_axis[0], z_axis[0],
+        x_axis[1], y_axis[1], z_axis[1],
+        x_axis[2], y_axis[2], z_axis[2]
+    };
 }
